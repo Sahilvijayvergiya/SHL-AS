@@ -29,7 +29,7 @@ class ConversationalAgent:
         }
     
     def process_conversation(self, messages: List[Message]) -> ChatResponse:
-        """Process conversation and generate response."""
+        """Process conversation and generate response using LLM."""
         self.conversation_context["turn_count"] = len([m for m in messages if m.role == "user"])
         
         # Enforce turn cap (max 8 turns total)
@@ -40,75 +40,24 @@ class ConversationalAgent:
                 end_of_conversation=True
             )
         
-        # Check for comparison request
-        comparison_result = self._check_for_comparison(messages)
-        if comparison_result:
-            return self._generate_comparison_response(comparison_result)
-        
-        # Check for finalization first (before removal)
-        if self._check_for_finalization(messages):
-            # Check if user wants to keep as-is
-            if self._is_keep_as_is(messages):
-                # Get previous recommendations from conversation
-                intent = self._extract_intent(messages)
-                recommendations = self._get_recommendations(intent)
-                reply = "Confirmed. Shortlist as above."
-                return ChatResponse(
-                    reply=reply,
-                    recommendations=[self._to_recommendation(r) for r in recommendations],
-                    end_of_conversation=True
-                )
-            
-            # Extract assessments mentioned in the final message
-            mentioned = self._extract_mentioned_assessments(messages[-1].content)
-            if mentioned:
-                reply = self._generate_finalization_reply(mentioned)
-                return ChatResponse(
-                    reply=reply,
-                    recommendations=[self._to_recommendation(r) for r in mentioned],
-                    end_of_conversation=True
-                )
-            else:
-                # Fall back to retrieval
-                intent = self._extract_intent(messages)
-                recommendations = self._get_recommendations(intent)
-                reply = self._generate_finalization_reply(recommendations)
-                return ChatResponse(
-                    reply=reply,
-                    recommendations=[self._to_recommendation(r) for r in recommendations],
-                    end_of_conversation=True
-                )
-        
-        # Check for removal request
-        removal = self._check_for_removal(messages)
-        if removal:
-            return self._handle_removal(removal, messages)
-        
-        # Check for refinement request
-        refinement = self._check_for_refinement(messages)
-        if refinement:
-            self._apply_refinement(refinement)
-        
-        # Extract user intent from conversation
-        intent = self._extract_intent(messages)
-        
-        # Check if we have enough context to recommend
-        if self._has_sufficient_context(intent):
-            recommendations = self._get_recommendations(intent)
-            reply = self._generate_recommendation_reply(recommendations, intent)
+        # Check for off-topic or injection attempts
+        last_user_msg = messages[-1].content if messages else ""
+        if self._is_off_topic(last_user_msg):
             return ChatResponse(
-                reply=reply,
-                recommendations=[self._to_recommendation(r) for r in recommendations],
-                end_of_conversation=False  # Don't end until user confirms
-            )
-        else:
-            # Ask clarifying question
-            reply = self._generate_clarification(intent)
-            return ChatResponse(
-                reply=reply,
+                reply="I can only help you with SHL assessment recommendations. For general hiring advice, legal questions, or other topics, please consult appropriate resources.",
                 recommendations=[],
                 end_of_conversation=False
             )
+        
+        if self._is_prompt_injection(last_user_msg):
+            return ChatResponse(
+                reply="I can only assist with SHL assessment recommendations. Please let me know if you need help finding the right assessments for your hiring needs.",
+                recommendations=[],
+                end_of_conversation=False
+            )
+        
+        # Use LLM to process conversation
+        return self._llm_process_conversation(messages)
     
     def _check_for_comparison(self, messages: List[Message]) -> Optional[List[str]]:
         """Check if user is asking for a comparison."""
@@ -585,3 +534,180 @@ class ConversationalAgent:
                 return True
         
         return False
+    
+    def _llm_process_conversation(self, messages: List[Message]) -> ChatResponse:
+        """Process conversation using LLM with RAG."""
+        # Format conversation for LLM
+        conversation_text = self._format_conversation(messages)
+        
+        # Get catalog context
+        catalog_context = self._get_catalog_context()
+        
+        # Build prompt
+        system_prompt = """You are a SHL Assessment Recommendation Agent. Your role is to help users find the right SHL assessments for their hiring needs.
+
+CATALOG CONTEXT:
+{catalog_context}
+
+INSTRUCTIONS:
+1. Only recommend assessments from the catalog above
+2. Ask clarifying questions if the user's request is vague
+3. Return 1-10 assessments with names and URLs when you have sufficient context
+4. Handle refinement requests (add/remove/change) by updating the shortlist
+5. Compare assessments when asked using only catalog data
+6. Stay within scope - only discuss SHL assessments
+7. End conversation when user confirms the shortlist
+
+RESPONSE FORMAT (JSON):
+{{
+  "reply": "your response text",
+  "recommendations": [
+    {{"name": "assessment name", "url": "catalog URL", "test_type": "K/P/A/S"}}
+  ],
+  "end_of_conversation": false
+}}
+
+If no recommendations are appropriate, return empty array for recommendations."""
+
+        user_prompt = f"""Conversation history:
+{conversation_text}
+
+Current turn: {self.conversation_context['turn_count']}
+
+Generate your response as JSON following the format above."""
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt.format(catalog_context=catalog_context)},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7,
+                response_format={"type": "json_object"}
+            )
+            
+            # Parse LLM response
+            import json
+            llm_response = json.loads(response.choices[0].message.content)
+            
+            # Validate recommendations against catalog
+            validated_recommendations = self._validate_recommendations(llm_response.get("recommendations", []))
+            
+            return ChatResponse(
+                reply=llm_response.get("reply", "I apologize, I couldn't process your request."),
+                recommendations=validated_recommendations,
+                end_of_conversation=llm_response.get("end_of_conversation", False)
+            )
+            
+        except Exception as e:
+            # Fallback to rule-based if LLM fails
+            print(f"LLM error: {e}, falling back to rule-based processing")
+            return self._fallback_process_conversation(messages)
+    
+    def _format_conversation(self, messages: List[Message]) -> str:
+        """Format conversation history for LLM."""
+        formatted = []
+        for msg in messages:
+            role = "User" if msg.role == "user" else "Assistant"
+            formatted.append(f"{role}: {msg.content}")
+        return "\n".join(formatted)
+    
+    def _get_catalog_context(self) -> str:
+        """Get catalog context for LLM."""
+        assessments = self.retrieval_system.catalog.assessments
+        context_parts = []
+        
+        # Limit to top 50 assessments to avoid token limits
+        for i, assessment in enumerate(assessments[:50]):
+            context_parts.append(
+                f"{i+1}. {assessment.name} (Type: {assessment.test_type}) - {assessment.description[:100]}... "
+                f"URL: {assessment.url} | Job Levels: {', '.join(assessment.job_levels[:3])} | "
+                f"Categories: {', '.join(assessment.categories[:3])}"
+            )
+        
+        return "\n".join(context_parts)
+    
+    def _validate_recommendations(self, recommendations: List[Dict]) -> List[Recommendation]:
+        """Validate that recommendations exist in catalog."""
+        validated = []
+        catalog_names = {a.name.lower(): a for a in self.retrieval_system.catalog.assessments}
+        
+        for rec in recommendations:
+            name = rec.get("name", "")
+            if name.lower() in catalog_names:
+                assessment = catalog_names[name.lower()]
+                validated.append(Recommendation(
+                    name=assessment.name,
+                    url=assessment.url,
+                    test_type=assessment.test_type
+                ))
+        
+        return validated
+    
+    def _fallback_process_conversation(self, messages: List[Message]) -> ChatResponse:
+        """Fallback rule-based processing if LLM fails."""
+        # Check for comparison request
+        comparison_result = self._check_for_comparison(messages)
+        if comparison_result:
+            return self._generate_comparison_response(comparison_result)
+        
+        # Check for finalization
+        if self._check_for_finalization(messages):
+            if self._is_keep_as_is(messages):
+                intent = self._extract_intent(messages)
+                recommendations = self._get_recommendations(intent)
+                reply = "Confirmed. Shortlist as above."
+                return ChatResponse(
+                    reply=reply,
+                    recommendations=[self._to_recommendation(r) for r in recommendations],
+                    end_of_conversation=True
+                )
+            
+            mentioned = self._extract_mentioned_assessments(messages[-1].content)
+            if mentioned:
+                reply = self._generate_finalization_reply(mentioned)
+                return ChatResponse(
+                    reply=reply,
+                    recommendations=[self._to_recommendation(r) for r in mentioned],
+                    end_of_conversation=True
+                )
+            else:
+                intent = self._extract_intent(messages)
+                recommendations = self._get_recommendations(intent)
+                reply = self._generate_finalization_reply(recommendations)
+                return ChatResponse(
+                    reply=reply,
+                    recommendations=[self._to_recommendation(r) for r in recommendations],
+                    end_of_conversation=True
+                )
+        
+        # Check for removal
+        removal = self._check_for_removal(messages)
+        if removal:
+            return self._handle_removal(removal, messages)
+        
+        # Check for refinement
+        refinement = self._check_for_refinement(messages)
+        if refinement:
+            self._apply_refinement(refinement)
+        
+        # Extract intent
+        intent = self._extract_intent(messages)
+        
+        # Check if sufficient context
+        if self._has_sufficient_context(intent):
+            recommendations = self._get_recommendations(intent)
+            reply = self._generate_recommendation_reply(recommendations, intent)
+            return ChatResponse(
+                reply=reply,
+                recommendations=[self._to_recommendation(r) for r in recommendations],
+                end_of_conversation=False
+            )
+        else:
+            reply = self._generate_clarification(intent)
+            return ChatResponse(
+                reply=reply,
+                recommendations=[],
+                end_of_conversation=False
+            )
