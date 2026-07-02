@@ -1,16 +1,20 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
 from models import ChatRequest, ChatResponse, HealthResponse
 from agent import ConversationalAgent
 from catalog import SHLCatalog
 from retrieval import RetrievalSystem
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 import asyncio
 
 load_dotenv()
 
 app = FastAPI(title="SHL Assessment Recommendation Agent")
+BASE_DIR = Path(__file__).resolve().parent
+CHAT_UI_PATH = BASE_DIR / "static" / "chat.html"
 
 # Add CORS middleware
 app.add_middleware(
@@ -261,6 +265,18 @@ async def startup_event():
 async def health_check():
     """Health check endpoint."""
     return HealthResponse(status="ok")
+
+
+@app.get("/")
+async def root():
+    """Redirect root requests to the chat interface."""
+    return RedirectResponse(url="/chat")
+
+
+@app.get("/chat")
+async def chat_interface():
+    """Serve the browser chat interface."""
+    return FileResponse(CHAT_UI_PATH)
 
 
 @app.post("/chat", response_model=ChatResponse)
